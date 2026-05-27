@@ -70,6 +70,13 @@ It reads:
 - `feedback/iter-*.json`
 - `state/state-*.json`
 
+Recent trace output separates who executed work from who should learn from a failure:
+
+- `executor`: agent/skill that ran the work.
+- `learning_owner`: skill/domain that should receive crystallization improvements.
+- `criterion_evidence`: score evidence by rubric criterion.
+- `owner_metrics`: retry and learning-signal aggregation by learning owner.
+
 It writes consolidated traces to:
 
 ```text
@@ -93,4 +100,3 @@ The core rule is simple:
 - This repository contains only the skill package, not local trace history.
 - Generated files such as `__pycache__` are intentionally ignored.
 - The skill expects the host agent runtime to provide agent delegation, user question, shell, and file-edit tools.
-

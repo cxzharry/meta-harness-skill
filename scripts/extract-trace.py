@@ -154,6 +154,26 @@ def first_non_empty(*values, limit=300):
     return ""
 
 
+def score_and_evidence(value):
+    """Return numeric score and compact evidence from a score value."""
+    if isinstance(value, (int, float)):
+        return value, ""
+    if isinstance(value, dict):
+        score = value.get("score")
+        if not isinstance(score, (int, float)):
+            score = None
+        evidence = first_non_empty(
+            value.get("evidence"),
+            value.get("reasoning"),
+            value.get("summary"),
+            value.get("message"),
+            value.get("description"),
+            limit=500,
+        )
+        return score, evidence
+    return None, ""
+
+
 def load_state(plan_dir: Path, iter_num: int):
     state_dir = plan_dir / "state"
     candidates = [
@@ -172,11 +192,149 @@ def infer_trace_kind(trace_id: str, plan_dir: Path):
     return "smoke" if "smoke" in marker else "run"
 
 
+def infer_orchestration(outcome, rubric):
+    """Return explicit orchestration metadata without guessing from filenames."""
+    orchestrator = (
+        outcome.get("orchestrator")
+        or rubric.get("orchestrator")
+        or outcome.get("pipeline_owner")
+        or rubric.get("pipeline_owner")
+        or "unknown"
+    )
+    used = (
+        outcome.get("meta_harness_used")
+        or rubric.get("meta_harness_used")
+        or orchestrator == "meta-harness"
+    )
+    return orchestrator, bool(used)
+
+
+def list_text(value) -> str:
+    """Compact arbitrary values into lowercase text for heuristic matching."""
+    return compact_text(value, limit=2000).lower()
+
+
+def infer_learning_attribution(data, state, failure_class, issue):
+    """Separate executor from the skill/domain that should learn from a failure.
+
+    `executor` records who ran the work. `learning_owner` records which skill is
+    a reasonable crystallize target. Unknown owners are excluded from evolution.
+    """
+    attribution = data.get("attribution") or state.get("attribution") or {}
+    explicit_owner = attribution.get("learning_owner")
+    explicit_executor = attribution.get("executor")
+    explicit_domain = attribution.get("failure_domain") or attribution.get("domain")
+    explicit_confidence = attribution.get("confidence")
+
+    executor = explicit_executor or data.get("executor") or data.get("skill") or "unknown"
+    if explicit_owner:
+        return {
+            "executor": executor,
+            "learning_owner": explicit_owner,
+            "learning_owner_confidence": explicit_confidence or "high",
+            "failure_domain": explicit_domain or "explicit",
+            "attribution_reason": attribution.get("reason") or "feedback attribution",
+        }
+
+    criteria = data.get("targeted_criteria") or state.get("targeted_criteria") or []
+    scores = data.get("scores") or {}
+    text = " ".join([
+        list_text(criteria),
+        list_text(scores.keys()),
+        list_text(issue),
+        list_text(data.get("evidence")),
+        list_text(data.get("summary")),
+        list_text(data.get("top_blockers")),
+        list_text(state.get("hypothesis")),
+        list_text(state.get("what_not_to_retry")),
+        list_text(failure_class),
+    ])
+
+    if str(failure_class).lower() == "environment" and any(
+        needle in text
+        for needle in ["runtime_recovery", "stability", "http 500", "dev server", "chunk", "manifest"]
+    ):
+        return {
+            "executor": executor,
+            "learning_owner": "debug",
+            "learning_owner_confidence": "high",
+            "failure_domain": "runtime_recovery",
+            "attribution_reason": "environment failure with runtime recovery signal",
+        }
+
+    rules = [
+        ("meta-harness", "trace_hygiene", "high", [
+            "failure_evidence_capture", "retry_failure_evidence_missing",
+            "trace_kind", "exclude_from_crystallize", "crystallize",
+            "agent_split_gate", "mode question", "parallel prompt",
+        ]),
+        ("debug", "runtime_recovery", "medium", [
+            "runtime_recovery", "stability", "http 500", "dev server",
+            "chunk", "manifest", "environment", "stale listener",
+        ]),
+        ("frontend-design", "ui_visual_design", "medium", [
+            "visual_restraint", "visual_hierarchy", "ui_render", "scanability",
+            "mobile_layout", "tap_simplicity", "visual_tokens",
+            "dashboard", "large red", "semantic badges", "card",
+        ]),
+        ("copywriting", "content_quality", "medium", [
+            "vietnamese_polish", "user_voice_realism", "pronoun",
+            "tone", "readability", "english_term_readability",
+        ]),
+        ("code-review", "verification_quality", "medium", [
+            "verification", "data_honesty", "accessibility", "security_and_scope",
+            "contract", "compatibility",
+        ]),
+    ]
+    for owner, domain, confidence, needles in rules:
+        if any(needle in text for needle in needles):
+            return {
+                "executor": executor,
+                "learning_owner": owner,
+                "learning_owner_confidence": confidence,
+                "failure_domain": domain,
+                "attribution_reason": "heuristic match from feedback criteria/evidence",
+            }
+
+    return {
+        "executor": executor,
+        "learning_owner": "unknown",
+        "learning_owner_confidence": "low",
+        "failure_domain": explicit_domain or "unknown",
+        "attribution_reason": "no reliable owner signal",
+    }
+
+
+def build_learning_signal(attribution, issue, targeted_criteria, what_not_to_retry, criterion_entries):
+    """Create a compact rule-change hint for future crystallization."""
+    avoid = what_not_to_retry if isinstance(what_not_to_retry, list) else [what_not_to_retry] if what_not_to_retry else []
+    evidence = first_non_empty(
+        [entry.get("evidence") for entry in criterion_entries if entry.get("evidence")],
+        issue,
+        limit=500,
+    )
+    criteria_text = ", ".join(str(c) for c in targeted_criteria or []) or "unspecified criteria"
+    owner = attribution["learning_owner"]
+    domain = attribution["failure_domain"]
+    if owner == "unknown":
+        recommendation = "Do not evolve automatically; attribution is unknown."
+    else:
+        recommendation = f"Improve {owner} rules for {domain}; focus on {criteria_text}."
+    return {
+        "summary": compact_text(issue, limit=300),
+        "evidence": evidence,
+        "should_add_rule": recommendation,
+        "avoid": avoid,
+        "confidence": attribution["learning_owner_confidence"],
+    }
+
+
 def main():
     plan_dir, trace_id = parse_args(sys.argv)
 
     # Read outcome.json (primary source of truth)
     outcome = load_json(plan_dir / "outcome.json") or {}
+    rubric = load_json(plan_dir / "rubric.json") or {}
 
     feedback_dir = plan_dir / "feedback"
     feedback_entries = collect_feedback_files(feedback_dir)
@@ -185,6 +343,7 @@ def main():
     iters_per_sprint = defaultdict(list)
     retries = []
     scores = defaultdict(list)
+    criterion_evidence = defaultdict(list)
     composite_per_iter = {}
     feedback_sources = []
 
@@ -195,14 +354,31 @@ def main():
         state = load_state(plan_dir, iter_num)
         feedback_sources.append(str(f.relative_to(plan_dir)))
 
-        # Collect criterion scores (supports both flat int/float and nested dict)
+        source_feedback = str(f.relative_to(plan_dir))
+
+        # Collect criterion scores and evidence.
         for criterion, value in (data.get("scores") or {}).items():
-            if isinstance(value, (int, float)):
-                scores[criterion].append(value)
-            elif isinstance(value, dict):
-                s = value.get("score")
-                if isinstance(s, (int, float)):
-                    scores[criterion].append(s)
+            score, evidence = score_and_evidence(value)
+            if isinstance(score, (int, float)):
+                scores[criterion].append(score)
+                criterion_evidence[criterion].append({
+                    "iter": iter_num,
+                    "score": score,
+                    "evidence": evidence,
+                    "source_feedback": source_feedback,
+                })
+
+        for criterion, entries in (data.get("criterion_evidence") or {}).items():
+            if not isinstance(entries, list):
+                entries = [entries]
+            for entry in entries:
+                score, evidence = score_and_evidence(entry)
+                criterion_evidence[criterion].append({
+                    "iter": iter_num,
+                    "score": score,
+                    "evidence": evidence or compact_text(entry, limit=500),
+                    "source_feedback": source_feedback,
+                })
 
         # Track composite per iter
         wc = data.get("weighted_composite")
@@ -222,15 +398,39 @@ def main():
                 state.get("hypothesis"),
                 limit=500,
             )
+            attribution = infer_learning_attribution(data, state, failure_class, issue)
+            retry_excluded = not issue or attribution["learning_owner"] == "unknown"
+            targeted_criteria = data.get("targeted_criteria") or state.get("targeted_criteria") or []
+            what_not_to_retry = state.get("what_not_to_retry") or data.get("what_not_to_retry") or []
+            targeted_evidence = []
+            for criterion in targeted_criteria:
+                targeted_evidence.extend(criterion_evidence.get(criterion, []))
+            learning_signal = build_learning_signal(
+                attribution,
+                issue,
+                targeted_criteria,
+                what_not_to_retry,
+                targeted_evidence,
+            )
             retries.append({
                 "iter": iter_num,
                 "sprint": sprint_n,
-                "skill": data.get("skill") or "fullstack-developer",
+                # Backwards compatibility: skill remains the executor, not the
+                # crystallize target. New consumers should use learning_owner.
+                "skill": attribution["executor"],
+                "executor": attribution["executor"],
+                "learning_owner": attribution["learning_owner"],
+                "learning_owner_confidence": attribution["learning_owner_confidence"],
+                "failure_domain": attribution["failure_domain"],
+                "attribution_reason": attribution["attribution_reason"],
+                "exclude_from_crystallize": retry_excluded,
                 "failure_class": failure_class or state.get("failure_class", ""),
                 "failure": issue,
-                "targeted_criteria": data.get("targeted_criteria") or state.get("targeted_criteria") or [],
-                "what_not_to_retry": state.get("what_not_to_retry") or data.get("what_not_to_retry") or [],
-                "source_feedback": str(f.relative_to(plan_dir)),
+                "targeted_criteria": targeted_criteria,
+                "criterion_evidence": targeted_evidence[:5],
+                "what_not_to_retry": what_not_to_retry,
+                "learning_signal": learning_signal,
+                "source_feedback": source_feedback,
             })
 
     # Determine outcome — prefer outcome.json exit_code
@@ -248,13 +448,58 @@ def main():
         or 0
     )
 
-    # Retry skill counts
-    skill_retry_counts = Counter(r["skill"] for r in retries)
-    highest_retry_skill = skill_retry_counts.most_common(1)[0][0] if skill_retry_counts else None
+    # Retry attribution counts. Executor is who ran work; learning_owner is the
+    # skill/domain that should learn from the friction.
+    executor_retry_counts = Counter(r["executor"] for r in retries)
+    owner_retry_counts = Counter(
+        r["learning_owner"]
+        for r in retries
+        if not r.get("exclude_from_crystallize")
+        and r.get("learning_owner")
+        and r.get("learning_owner") != "unknown"
+    )
+    unknown_learning_owner_count = sum(1 for r in retries if r.get("learning_owner") == "unknown")
+    highest_retry_executor = executor_retry_counts.most_common(1)[0][0] if executor_retry_counts else None
+    highest_learning_owner = owner_retry_counts.most_common(1)[0][0] if owner_retry_counts else None
 
     # Average criterion scores
     avg_scores = {k: sum(v) / len(v) for k, v in scores.items() if v}
     lowest_avg_criterion = min(avg_scores, key=avg_scores.get) if avg_scores else None
+
+    owner_metrics = {}
+    for retry in retries:
+        if retry.get("exclude_from_crystallize"):
+            continue
+        owner = retry["learning_owner"]
+        metrics = owner_metrics.setdefault(owner, {
+            "retry_count": 0,
+            "failure_domains": Counter(),
+            "targeted_criteria": Counter(),
+            "targeted_scores": [],
+            "examples": [],
+            "learning_signals": [],
+        })
+        metrics["retry_count"] += 1
+        metrics["failure_domains"][retry["failure_domain"]] += 1
+        for criterion in retry.get("targeted_criteria") or []:
+            metrics["targeted_criteria"][criterion] += 1
+            metrics["targeted_scores"].extend(scores.get(criterion, []))
+        metrics["examples"].append({
+            "failure": retry.get("failure", ""),
+            "source_feedback": retry.get("source_feedback", ""),
+        })
+        metrics["learning_signals"].append(retry["learning_signal"])
+
+    for owner, metrics in owner_metrics.items():
+        targeted_scores = metrics.pop("targeted_scores")
+        metrics["failure_domains"] = dict(metrics["failure_domains"])
+        metrics["targeted_criteria"] = dict(metrics["targeted_criteria"])
+        metrics["avg_targeted_score"] = (
+            sum(targeted_scores) / len(targeted_scores)
+            if targeted_scores else None
+        )
+        metrics["examples"] = metrics["examples"][:3]
+        metrics["learning_signals"] = metrics["learning_signals"][:3]
 
     # Composite trajectory: prefer outcome.json, supplement with per-feedback composites
     composite_trajectory = outcome.get("composite_trajectory") or [
@@ -274,10 +519,20 @@ def main():
 
     trace_kind = infer_trace_kind(trace_id, plan_dir)
     group_key = plan_group_key(plan_dir)
+    orchestrator, meta_harness_used = infer_orchestration(outcome, rubric)
+    missing_failure_evidence = sum(1 for r in retries if not r.get("failure"))
+    crystallize_eligible_retries = sum(1 for r in retries if not r.get("exclude_from_crystallize"))
+    exclude_from_crystallize = (
+        trace_kind == "smoke"
+        or missing_failure_evidence > 0
+        or (len(retries) > 0 and crystallize_eligible_retries == 0)
+    )
 
     trace = {
         "id": trace_id,
         "pipeline": "adversarial-dev",
+        "orchestrator": orchestrator,
+        "meta_harness_used": meta_harness_used,
         "trace_kind": trace_kind,
         "generated": datetime.now(timezone.utc).isoformat(),
         "plan_dir": str(plan_dir),
@@ -291,12 +546,18 @@ def main():
         "retries": retries,
         "evaluator_scores": {k: v for k, v in scores.items()},
         "evaluator_scores_avg": avg_scores,
+        "criterion_evidence": {k: v for k, v in criterion_evidence.items()},
+        "owner_metrics": owner_metrics,
         "friction_summary": {
-            "highest_retry_skill": highest_retry_skill,
+            "highest_retry_skill": highest_retry_executor,
+            "highest_retry_executor": highest_retry_executor,
+            "highest_learning_owner": highest_learning_owner,
             "lowest_avg_criterion": lowest_avg_criterion,
             "total_retries": len(retries),
-            "retry_failure_evidence_missing": sum(1 for r in retries if not r.get("failure")),
-            "exclude_from_crystallize": trace_kind == "smoke",
+            "crystallize_eligible_retries": crystallize_eligible_retries,
+            "retry_failure_evidence_missing": missing_failure_evidence,
+            "unknown_learning_owner_count": unknown_learning_owner_count,
+            "exclude_from_crystallize": exclude_from_crystallize,
             "dedupe_key": group_key,
         },
         "outcome": final_outcome,
